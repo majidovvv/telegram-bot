@@ -2,19 +2,23 @@
 
 FROM python:3.11-slim
 
-# Install all OS dependencies needed by:
-#  - pyzbar (zbar)
-#  - tesseract OCR
-#  - OpenCV (libGL.so.1)
+# Install system dependencies needed by:
+# - pyzbar (zbar)
+# - tesseract-ocr
+# - OpenCV (libGL, libglib, etc.)
 RUN apt-get update && apt-get install -y \
     libzbar0 \
     tesseract-ocr \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy code
+# Copy your code
 COPY . /app
 
 # Install Python dependencies
