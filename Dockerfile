@@ -1,19 +1,24 @@
 # Dockerfile
 
-# Use a lightweight Python image
 FROM python:3.11-slim
 
-# Install system dependencies needed by pyzbar (zbar) and Tesseract OCR
-RUN apt-get update && apt-get install -y libzbar0 tesseract-ocr
+# Install all OS dependencies needed by:
+#  - pyzbar (zbar)
+#  - tesseract OCR
+#  - OpenCV (libGL.so.1)
+RUN apt-get update && apt-get install -y \
+    libzbar0 \
+    tesseract-ocr \
+    libgl1-mesa-glx \
+ && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /app
 
-# Copy all project files into /app
+# Copy code
 COPY . /app
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Run the bot when the container starts
+# Start the bot
 CMD ["python", "bot.py"]
