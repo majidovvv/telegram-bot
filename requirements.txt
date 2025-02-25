@@ -1,3 +1,5 @@
+# requirements.txt
+
 pyTelegramBotAPI
 google-auth
 google-auth-oauthlib
@@ -7,3 +9,4 @@ pyzbar
 pillow
 gspread
 oauth2client
+pytesseract
