@@ -1,5 +1,3 @@
-# requirements.txt
-
 pyTelegramBotAPI
 google-auth
 google-auth-oauthlib

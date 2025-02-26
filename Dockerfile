@@ -1,11 +1,9 @@
-# Dockerfile
-
 FROM python:3.11-slim
 
-# 1) Install system dependencies needed by:
-#    - pyzbar (zbar)
-#    - Tesseract OCR
-#    - OpenCV (libGL, libglib, etc.)
+# Install system dependencies needed by:
+#  - pyzbar (zbar)
+#  - Tesseract OCR
+#  - OpenCV (libGL, etc.)
 RUN apt-get update && apt-get install -y \
     libzbar0 \
     tesseract-ocr \
@@ -19,11 +17,8 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# 2) Copy project files
 COPY . /app
 
-# 3) Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 4) Start the bot
 CMD ["python", "bot.py"]
