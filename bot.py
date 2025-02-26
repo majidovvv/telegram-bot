@@ -3,7 +3,7 @@ import json
 import re
 import cv2
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, request, abort
 import telebot
@@ -17,7 +17,7 @@ from thefuzz import process
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 ########################################
-# ENV & BOT SETUP
+# ENV
 ########################################
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -31,7 +31,7 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
 ########################################
-# GOOGLE SHEETS
+# GSheets
 ########################################
 creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
 scope = [
@@ -40,39 +40,39 @@ scope = [
 ]
 credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gc = gspread.authorize(credentials)
-
 main_sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 print("Connected to main sheet:", main_sheet.title)
 
-# Load asset data for fuzzy matching
 try:
     asset_worksheet = gc.open_by_key(SPREADSHEET_ID).worksheet(ASSET_TAB_NAME)
     asset_data = asset_worksheet.col_values(1)
     if asset_data and asset_data[0].lower().startswith("asset"):
         asset_data.pop(0)
 except Exception as e:
-    print("Error loading asset data from tab:", e)
+    print("Error loading asset data:", e)
     asset_data = []
 
-print(f"Loaded {len(asset_data)} asset names from '{ASSET_TAB_NAME}' tab.")
+print(f"Loaded {len(asset_data)} asset names from {ASSET_TAB_NAME}.")
 
 ########################################
-# IN-MEMORY SESSION
+# In-memory session data
 ########################################
-user_data = {}  # chat_id -> {...} 
-user_state = {} # chat_id -> string
+user_data = {}  # chat_id -> {...}
+user_state = {} # chat_id -> state string
 
 STATE_IDLE = "idle"
-STATE_WAIT_LOCATION = "wait_location"
 STATE_WAIT_PHOTO = "wait_photo"
+STATE_WAIT_LOCATION = "wait_location"
 STATE_WAIT_ASSET = "wait_asset"
 STATE_WAIT_ASSET_PICK = "wait_asset_pick"
 STATE_WAIT_QUANTITY = "wait_quantity"
 
 def init_session(chat_id):
+    now = datetime.now()
     user_data[chat_id] = {
         "mode": "single",
         "location": "",
+        "location_timestamp": now - timedelta(days=1), # so we definitely ask on first go
         "barcodes": [],
         "index": 0,
         "asset_name": "",
@@ -81,7 +81,7 @@ def init_session(chat_id):
     user_state[chat_id] = STATE_IDLE
 
 ########################################
-# WEBHOOK SETUP
+# Webhook
 ########################################
 def setup_webhook():
     bot.remove_webhook()
@@ -91,7 +91,24 @@ def setup_webhook():
     print("Webhook set to:", url)
 
 ########################################
-# UTILS: Fuzzy
+# Check if location is needed
+########################################
+def need_location(chat_id):
+    """
+    Returns True if it's been 30+ minutes since last location,
+    or if the date changed (midnight).
+    """
+    now = datetime.now()
+    last_time = user_data[chat_id]["location_timestamp"]
+    if (now - last_time) > timedelta(minutes=30):
+        # or check if day changed
+        if now.date() != last_time.date():
+            return True
+        return True
+    return False
+
+########################################
+# Fuzzy Suggest
 ########################################
 def fuzzy_suggest(query, data, limit=3):
     if not data:
@@ -100,56 +117,58 @@ def fuzzy_suggest(query, data, limit=3):
     return results
 
 ########################################
-# MULTI-BARCODE DETECTION
+# Barcode Multi Detection
 ########################################
 def detect_multi_barcodes(np_img):
     """
-    Returns a list of barcodes found in one image,
-    ignoring random text that doesn't match e.g. '^AZT...' pattern.
+    Attempts a morphological approach + multiple angles to find all barcodes.
+    Filters out non-AZT codes if you want only those.
     """
     gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3,3), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
 
     inv = 255 - thresh
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9,3))
+    # bigger kernel to unify close bars
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11,4))
     morph = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    found_codes = []
 
-    angles = [0, 90, 180, 270]
+    found_codes = []
+    angles = list(range(0, 360, 15))  # try every 15° for better coverage
+
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         if w > 20 and h > 20:
             region = np_img[y:y+h, x:x+w]
-            matched = False
-            for ang in angles:
-                rotated = rotate_image(region, ang)
-                code = decode_zbar(rotated)
-                if code:
-                    # Filter out random text
+            decoded = try_decode_region(region, angles)
+            if decoded:
+                for code in decoded:
                     if is_our_barcode(code):
                         found_codes.append(code)
-                    matched = True
-                    break
-            if not matched:
-                # fallback OCR if you want
-                # code_ocr = decode_ocr(region)
-                # if code_ocr and is_our_barcode(code_ocr):
-                #     found_codes.append(code_ocr)
-                pass
+    # also try entire image
+    entire = try_decode_region(np_img, angles)
+    if entire:
+        for c in entire:
+            if is_our_barcode(c) and c not in found_codes:
+                found_codes.append(c)
 
-    # Also try entire image as fallback
-    entire = decode_zbar(np_img)
-    if entire and is_our_barcode(entire) and entire not in found_codes:
-        found_codes.append(entire)
-
+    print("DEBUG: Found barcodes ->", found_codes)
     return found_codes
+
+def try_decode_region(np_img, angles):
+    results = []
+    for angle in angles:
+        rot = rotate_image(np_img, angle)
+        code = decode_zbar(rot)
+        if code and code not in results:
+            results.append(code)
+    return results
 
 def rotate_image(cv_img, angle):
     (h, w) = cv_img.shape[:2]
-    center = (w//2, h//2)
+    center = (w // 2, h // 2)
     M = cv2.getRotationMatrix2D(center, angle, 1.0)
     rotated = cv2.warpAffine(cv_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return rotated
@@ -157,70 +176,77 @@ def rotate_image(cv_img, angle):
 def decode_zbar(cv_img):
     from PIL import Image
     pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
-    barcodes = decode(pil_img)
-    if barcodes:
-        return barcodes[0].data.decode("utf-8")
+    codes = decode(pil_img)
+    if codes:
+        return codes[0].data.decode("utf-8")
     return None
 
 def is_our_barcode(code):
-    """
-    E.g., return True if code matches 'AZT\d{something}'
-    or length or any other pattern.
-    Adjust as you see fit.
-    """
-    # Example: if it starts with "AZT" and has digits after
+    # Example: only accept if it matches "AZT" pattern
     pattern = r'^AZT\d+'
     return bool(re.match(pattern, code))
 
 ########################################
-# START DAY / CANCEL
+# ASK LOCATION if needed
+########################################
+def check_location(chat_id):
+    if need_location(chat_id):
+        # ask user to confirm or update location
+        user_state[chat_id] = STATE_WAIT_LOCATION
+        bot.send_message(chat_id,
+            "Görünür 30+ dəqiqə keçib və ya yeni gün başlayıb.\n"
+            "Zəhmət olmasa yeni lokasiyanı daxil edin (örn: 'Anbar 3').")
+        return True
+    return False
+
+########################################
+# MAIN FLOW: daily start replaced with location check
 ########################################
 @bot.message_handler(commands=['start'])
-def cmd_start(message):
-    chat_id = message.chat.id
-    init_session(chat_id)
-
-    kb = InlineKeyboardMarkup()
-    kb.row(
-        InlineKeyboardButton("Start Day", callback_data="DAY_START"),
-        InlineKeyboardButton("Cancel Day", callback_data="DAY_CANCEL")
-    )
-    bot.send_message(chat_id,
-        "👋 Salam! Günü başlamaq üçün 'Start Day' düyməsinə basın, "
-        "və ya 'Cancel Day' ilə imtina edin.",
-        reply_markup=kb
-    )
-
-@bot.callback_query_handler(func=lambda c: c.data in ["DAY_START", "DAY_CANCEL"])
-def day_start_cancel(call):
-    chat_id = call.message.chat.id
-    if call.data == "DAY_CANCEL":
-        init_session(chat_id)
-        bot.send_message(chat_id, "Gün ləğv edildi. /start ilə yenidən başlaya bilərsiniz.")
-        return
-
-    # pick location
-    user_state[chat_id] = STATE_WAIT_LOCATION
-    bot.send_message(chat_id,
-        "Zəhmət olmasa çalışdığınız lokasiyanı daxil edin. Məsələn: 'Anbar 3'.")
-
-@bot.message_handler(func=lambda m: user_state.get(m.chat.id)==STATE_WAIT_LOCATION, content_types=['text'])
-def handle_location(m):
+def cmd_start(m):
     chat_id = m.chat.id
-    loc = m.text.strip()
-    user_data[chat_id]["location"] = loc
+    # If brand new
+    if chat_id not in user_data:
+        init_session(chat_id)
 
-    # Let user pick single vs multi
+    # Otherwise, we check location
+    if not user_data[chat_id]["location"] or need_location(chat_id):
+        user_state[chat_id] = STATE_WAIT_LOCATION
+        bot.send_message(chat_id,
+            "Günü yenidən başlamaq istəyirsiniz? Lokasiyanı daxil edin. "
+            "Məsələn: 'Anbar A'.")
+    else:
+        # location is still valid
+        # ask single vs multi
+        show_mode_keyboard(chat_id)
+
+@bot.message_handler(commands=['cancel'])
+def cmd_cancel(m):
+    chat_id = m.chat.id
+    init_session(chat_id)
+    bot.send_message(chat_id,
+        "Cari proses ləğv edildi. /start yaza bilərsiniz yenidən başlamaq üçün.")
+
+@bot.message_handler(func=lambda msg: user_state.get(msg.chat.id)==STATE_WAIT_LOCATION, content_types=['text'])
+def handle_location(msg):
+    chat_id = msg.chat.id
+    loc = msg.text.strip()
+    user_data[chat_id]["location"] = loc
+    user_data[chat_id]["location_timestamp"] = datetime.now()
+    show_mode_keyboard(chat_id)
+
+def show_mode_keyboard(chat_id):
     kb = InlineKeyboardMarkup()
     kb.row(
         InlineKeyboardButton("Tək Barkod", callback_data="MODE_SINGLE"),
         InlineKeyboardButton("Çox Barkod", callback_data="MODE_MULTI")
     )
+    loc = user_data[chat_id]["location"]
     bot.send_message(chat_id,
-        f"Lokasiya: <b>{loc}</b> qeyd edildi.\nRejimi seçin:",
+        f"Lokasiya: <b>{loc}</b>.\n"
+        "Skan rejimini seçin:",
         reply_markup=kb
     )
-    user_state[chat_id] = STATE_WAIT_PHOTO  # We'll finalize mode after callback
 
 @bot.callback_query_handler(func=lambda c: c.data in ["MODE_SINGLE", "MODE_MULTI"])
 def pick_mode(call):
@@ -232,15 +258,15 @@ def pick_mode(call):
 
     if mode == "MODE_SINGLE":
         bot.send_message(chat_id,
-            "Tək barkod rejimi. Zəhmət olmasa barkodun şəklini göndərin.\n"
-            "Yenidən /start yaza bilərsiniz lazım olsa.")
+            "Tək barkod rejimi. Zəhmət olmasa barkodun şəklini göndərin.")
     else:
         bot.send_message(chat_id,
-            "Çox barkod rejimi.\nBir neçə barkod şəkli göndərə bilərsiniz.")
+            "Çox barkod rejimi.\nBirdən çox barkod şəkli göndərin.\n"
+            "Bitirdikdə 'Bitir' düyməsini basın.")
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("Bitir", callback_data="FINISH_MULTI"))
         bot.send_message(chat_id,
-            "Sonda 'Bitir' düyməsini basın.",
+            "Skanı bitirmək üçün bu düymədən istifadə edin.",
             reply_markup=kb
         )
 
@@ -249,33 +275,31 @@ def pick_mode(call):
 @bot.callback_query_handler(func=lambda c: c.data == "FINISH_MULTI")
 def finish_multi_callback(call):
     chat_id = call.message.chat.id
-    barcodes = user_data[chat_id]["barcodes"]
-    if not barcodes:
-        bot.send_message(chat_id, "Heç bir barkod tapılmadı. Yenidən şəkil göndərin.")
+    if not user_data[chat_id]["barcodes"]:
+        bot.send_message(chat_id,
+            "Heç bir barkod yoxdur. Yenidən şəkil göndərin.")
         return
     user_data[chat_id]["index"] = 0
-    first_bc = barcodes[0]
+    bc_list = user_data[chat_id]["barcodes"]
+    first_bc = bc_list[0]
     bot.send_message(chat_id,
-        f"{len(barcodes)} barkod aşkarlanıb.\n"
-        f"1-ci barkod: <b>{first_bc}</b>\nMəhsul adını (tam və ya qismən) daxil edin."
+        f"{len(bc_list)} barkod aşkar olunub.\n"
+        f"1-ci barkod: <b>{first_bc}</b>\n"
+        "Məhsul adını (tam və ya qismən) daxil edin."
     )
     user_state[chat_id] = STATE_WAIT_ASSET
 
 ########################################
-# Photo => multi-barcodes
+# Photo => multi barcodes
 ########################################
 @bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    chat_id = message.chat.id
-    state = user_state.get(chat_id, STATE_IDLE)
-
-    if state != STATE_WAIT_PHOTO:
-        bot.send_message(chat_id,
-            "Hazırda şəkil qəbul edilmir. /start ilə yenidən cəhd edin.")
+def handle_photo(msg):
+    chat_id = msg.chat.id
+    if user_state.get(chat_id, STATE_IDLE) != STATE_WAIT_PHOTO:
+        bot.send_message(chat_id, "Hazırda şəkil qəbul edilmir. /start edin.")
         return
 
-    # decode multi barcodes
-    file_id = message.photo[-1].file_id
+    file_id = msg.photo[-1].file_id
     info = bot.get_file(file_id)
     downloaded = bot.download_file(info.file_path)
     np_img = np.frombuffer(downloaded, np.uint8)
@@ -284,16 +308,16 @@ def handle_photo(message):
     found = detect_multi_barcodes(cv_img)
     if not found:
         bot.send_message(chat_id,
-            "Heç bir barkod tapılmadı. Daha yaxın və ya aydın şəkil çəkin.")
+            "Heç bir barkod tapılmadı. Zəhmət olmasa daha aydın və yaxın şəkil çəkin.")
         return
 
     if user_data[chat_id]["mode"] == "single":
-        # pick first or all?
+        # pick the first code from the image
         bc = found[0]
         user_data[chat_id]["barcodes"] = [bc]
         if len(found) > 1:
             bot.send_message(chat_id,
-                f"{len(found)} barkod aşkarlandı, birincisi götürülür: <b>{bc}</b>")
+                f"{len(found)} barkod aşkar olundu, birincisi götürülür: <b>{bc}</b>.")
         else:
             bot.send_message(chat_id,
                 f"Barkod: <b>{bc}</b>")
@@ -304,25 +328,25 @@ def handle_photo(message):
         # multi mode => add all
         user_data[chat_id]["barcodes"].extend(found)
         bot.send_message(chat_id,
-            f"Barkod(lar) tapıldı: {', '.join(found)}\n"
-            "Daha şəkil göndərin və ya 'Bitir' düyməsini basın."
+            f"Barkod(lar): {', '.join(found)}\n"
+            "Daha şəkil göndərə ya da 'Bitir' düyməsini basın."
         )
 
 ########################################
 # Wait for Asset Name
 ########################################
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id)==STATE_WAIT_ASSET, content_types=['text'])
-def handle_asset_name(m):
+def handle_asset(m):
     chat_id = m.chat.id
-    query = m.text.strip()
-    suggestions = fuzzy_suggest(query, asset_data, limit=3)
+    q = m.text.strip()
+
+    suggestions = fuzzy_suggest(q, asset_data, limit=3)
     if not suggestions:
-        # Accept as custom
-        user_data[chat_id]["asset_name"] = query
+        # no suggestions => accept as custom
+        user_data[chat_id]["asset_name"] = q
         ask_quantity(chat_id)
         return
 
-    # Build inline kb with suggestions + "Custom Name"
     kb = InlineKeyboardMarkup()
     for (name, score) in suggestions:
         kb.add(InlineKeyboardButton(
@@ -330,10 +354,10 @@ def handle_asset_name(m):
             callback_data=f"ASSET_PICK|{name}"
         ))
     kb.add(InlineKeyboardButton(
-        text="Custom Name", callback_data=f"ASSET_CUSTOM|{query}"
+        text="Custom Name", callback_data=f"ASSET_CUSTOM|{q}"
     ))
     bot.send_message(chat_id,
-        "Uyğun ola biləcək adlar. Aşağıdan seçin, ya öz adınızı təkrar yazın:",
+        "Tapdığım uyğun adlar. Seçin və ya yeni ad yazın:",
         reply_markup=kb
     )
     user_state[chat_id] = STATE_WAIT_ASSET_PICK
@@ -341,10 +365,10 @@ def handle_asset_name(m):
 @bot.message_handler(func=lambda m: user_state.get(m.chat.id)==STATE_WAIT_ASSET_PICK, content_types=['text'])
 def handle_asset_retry(m):
     chat_id = m.chat.id
-    query = m.text.strip()
-    suggestions = fuzzy_suggest(query, asset_data, limit=3)
+    q = m.text.strip()
+    suggestions = fuzzy_suggest(q, asset_data, limit=3)
     if not suggestions:
-        user_data[chat_id]["asset_name"] = query
+        user_data[chat_id]["asset_name"] = q
         ask_quantity(chat_id)
         return
 
@@ -355,29 +379,29 @@ def handle_asset_retry(m):
             callback_data=f"ASSET_PICK|{name}"
         ))
     kb.add(InlineKeyboardButton(
-        text="Custom Name", callback_data=f"ASSET_CUSTOM|{query}"
+        text="Custom Name", callback_data=f"ASSET_CUSTOM|{q}"
     ))
     bot.send_message(chat_id,
-        "Aşağıdan uyğun adı seçin, ya başqa ad daxil edin:",
+        "Seçin ya başqa ad yazın:",
         reply_markup=kb
     )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ASSET_PICK|"))
-def pick_asset_callback(call):
+def cb_asset_pick(call):
     chat_id = call.message.chat.id
-    chosen_name = call.data.split("|")[1]
-    user_data[chat_id]["asset_name"] = chosen_name
+    chosen = call.data.split("|")[1]
+    user_data[chat_id]["asset_name"] = chosen
     ask_quantity(chat_id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ASSET_CUSTOM|"))
-def pick_asset_custom(call):
+def cb_asset_custom(call):
     chat_id = call.message.chat.id
     custom = call.data.split("|")[1]
     user_data[chat_id]["asset_name"] = custom
     ask_quantity(chat_id)
 
 ########################################
-# Quantity with Inline Buttons
+# Ask Quantity
 ########################################
 def ask_quantity(chat_id):
     kb = InlineKeyboardMarkup()
@@ -395,7 +419,7 @@ def ask_quantity(chat_id):
     user_state[chat_id] = STATE_WAIT_QUANTITY
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("QTY|"))
-def pick_qty_button(call):
+def cb_qty_pick(call):
     chat_id = call.message.chat.id
     pick = call.data.split("|")[1]
     if pick == "OTHER":
@@ -412,7 +436,7 @@ def handle_qty_text(m):
     try:
         val = int(txt)
     except:
-        bot.send_message(chat_id, "Zəhmət olmasa düzgün rəqəm daxil edin.")
+        bot.send_message(chat_id, "Zəhmət olmasa düzgün rəqəm.")
         return
     user_data[chat_id]["qty"] = val
     finalize_barcode(chat_id)
@@ -422,55 +446,55 @@ def finalize_barcode(chat_id):
     idx = data["index"]
     bc_list = data["barcodes"]
     if idx >= len(bc_list):
-        bot.send_message(chat_id, "Xəta: barkod siyahısı tükəndi.")
+        bot.send_message(chat_id, "Xəta: barkod siyahısında mövqedən kənardayıq.")
         user_state[chat_id] = STATE_IDLE
         return
 
     bc = bc_list[idx]
-    asset = data["asset_name"]
+    desc = data["asset_name"]
     quantity = data["qty"]
-    location = data["location"]
+    loc = data["location"]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Save row => [time, location, bc, asset, qty]
+    # Save row: [time, location, bc, desc, qty]
     try:
-        main_sheet.append_row([now, location, bc, asset, quantity])
+        main_sheet.append_row([now, loc, bc, desc, quantity])
         bot.send_message(chat_id,
-            f"✅ Qeyd edildi:\nTarix: {now}\nLokasiya: {location}\nBarkod: {bc}\nAd: {asset}\nSay: {quantity}"
+            f"✅ Qeyd:\nTarix: {now}\nLokasiya: {loc}\nBarkod: {bc}\nAd: {desc}\nSay: {quantity}"
         )
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Cədvələ əlavə xətası: {e}")
+        bot.send_message(chat_id, f"❌ Xəta cədvələ əlavə edərkən: {e}")
 
-    # Next if multi
     if data["mode"] == "multi":
         data["index"] += 1
         if data["index"] < len(bc_list):
-            nxt = bc_list[data["index"]]
+            next_bc = bc_list[data["index"]]
             bot.send_message(chat_id,
-                f"{data['index']+1}-ci barkod: <b>{nxt}</b>\nMəhsul adını daxil edin:"
+                f"{data['index']+1}-ci barkod: <b>{next_bc}</b>\n"
+                "Məhsul adını daxil edin (tam ya qismən)."
             )
             user_state[chat_id] = STATE_WAIT_ASSET
         else:
             bot.send_message(chat_id,
-                "Bütün barkodların məlumatı əlavə olundu! Təşəkkürlər.")
+                "Bütün barkodların məlumatı yazıldı! Sağ olun.")
             user_state[chat_id] = STATE_IDLE
     else:
         # single done
         bot.send_message(chat_id,
-            "Tək barkod prosesi bitdi. Yeni gün üçün /start yaza bilərsiniz.")
+            "Tək barkod prosesi bitdi! /start yazın yeni gün üçün.")
         user_state[chat_id] = STATE_IDLE
 
 ########################################
-# CANCEL approach
+# /cancel
 ########################################
 @bot.message_handler(commands=['cancel'])
 def cmd_cancel(m):
     chat_id = m.chat.id
     init_session(chat_id)
-    bot.send_message(chat_id, "Cari gün ləğv edildi. /start yazın yenidən başlamaq üçün.")
+    bot.send_message(chat_id, "Cari proses ləğv edildi. /start yazın yenidən başlamaq üçün.")
 
 ########################################
-# FLASK ROUTES
+# FLASK
 ########################################
 @app.route("/", methods=['GET'])
 def home():
@@ -483,13 +507,9 @@ def telegram_webhook():
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
         return "ok", 200
-    else:
-        abort(403)
+    abort(403)
 
-########################################
-# APP ENTRY
-########################################
 if __name__ == "__main__":
     setup_webhook()
-    # Gunicorn will run 'app'
+    # Gunicorn runs 'app'
     pass
