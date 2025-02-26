@@ -1,28 +1,31 @@
-# Use a minimal Python image
+# Dockerfile
+
 FROM python:3.11-slim
 
-# Set the working directory
 WORKDIR /app
 
-# Install system dependencies for OpenCV & barcode scanning
+# Install system dependencies needed for:
+#  - OpenCV (libGL, etc.)
+#  - zbar (for pyzbar)
+#  - tesseract (if you want OCR fallback)
 RUN apt-get update && apt-get install -y \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libzbar0 \
     tesseract-ocr \
-    && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Copy requirements
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot script
+# Copy the bot code
 COPY bot.py .
 
-# Expose the port for Flask
+# Expose port 5000 for the web service
 EXPOSE 5000
 
-# Start the bot using Gunicorn
+# Start with Gunicorn, binding to 0.0.0.0:5000
 CMD ["gunicorn", "-b", "0.0.0.0:5000", "bot:app"]
