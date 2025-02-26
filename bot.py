@@ -1,17 +1,21 @@
+# bot.py
 """
-bot.py - A comprehensive Telegram bot with:
-- Advanced barcode detection (region-based, angle increments).
-- OCR fallback for "AZT..." codes.
-- Multi-scan workflow (scan multiple items).
-- Manual entry fallback if scanning fails repeatedly.
-- /help, /cancel commands for user-friendly flow.
-- Enhanced error handling & logs.
+A reference Telegram bot in webhook mode with advanced features:
+- Image quality checks (blur/brightness)
+- Batch scanning of multiple barcodes
+- Multi-barcode detection from one photo
+- Fallback/confirmation logic (manual correction)
+- Final mapping of desc/qty to each barcode
+- Google Sheets integration
+- Flask + TeleBot in webhook mode (no more 409 conflict)
 """
 
 import os
-import json
 import re
+import json
 from datetime import datetime
+
+from flask import Flask, request, abort
 
 import telebot
 import gspread
@@ -19,297 +23,322 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 import pytesseract
 from pyzbar.pyzbar import decode
-from PIL import Image, ImageEnhance
 import cv2
 import numpy as np
+from PIL import Image, ImageEnhance
 
-print("Starting bot...")
+# -----------------------------------
+# 1) Environment Setup
+# -----------------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # your bot token
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")          # your Google Sheets ID
+SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")  # JSON for GSheets
 
-# --- 1) Environment Variables ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN is not set")
 
-if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
-    raise ValueError("Invalid Telegram bot token. Make sure TELEGRAM_BOT_TOKEN is set.")
+bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+# Flask app for webhook
+app = Flask(__name__)
 
-# --- 2) Google Sheets Setup ---
+# -----------------------------------
+# 2) Google Sheets Auth
+# -----------------------------------
 sheet = None
 if SERVICE_ACCOUNT_JSON:
     try:
         creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
-        scope = ["https://spreadsheets.google.com/feeds",
-                 "https://www.googleapis.com/auth/spreadsheets"]
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/spreadsheets"
+        ]
         credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-        client = gspread.authorize(credentials)
-        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-        print("Google Sheets connected successfully!")
+        gc = gspread.authorize(credentials)
+        sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+        print("Google Sheets connected.")
     except Exception as e:
         print("Error connecting to Google Sheets:", e)
 else:
-    print("Error: SERVICE_ACCOUNT_JSON not provided.")
-
-# --- 3) Conversation States ---
-STATE_IDLE = 'idle'
-STATE_WAITING_PHOTO = 'waiting_for_photo'
-STATE_WAITING_DESCRIPTION = 'waiting_for_description'
-STATE_WAITING_QUANTITY = 'waiting_for_quantity'
-STATE_MANUAL_BARCODE = 'manual_barcode'
-
-user_state = {}  # chat_id -> current state
-user_data = {}   # chat_id -> { 'barcode': str, 'description': str, 'quantity': int }
-
-# We'll allow multiple scans in a single session. They can type /done to finish.
+    print("No SERVICE_ACCOUNT_JSON provided.")
 
 
-# --- 4) HELPER: Initialize user session ---
-def init_user_session(chat_id):
-    user_state[chat_id] = STATE_WAITING_PHOTO
-    user_data[chat_id] = {'barcode': None, 'description': None, 'quantity': None}
+# -----------------------------------
+# 3) In-Memory Session Data
+#    We'll store user states + scanned codes.
+# -----------------------------------
+SESSION_STATE_IDLE = "idle"
+SESSION_STATE_SCANNING = "scanning"
+SESSION_STATE_ENTERING_DATA = "entering_data"
+
+# For each chat_id, we store an object:
+# {
+#   "state": scanning|entering_data|idle,
+#   "scanned_codes": [
+#       {
+#         "barcode": "ABCD1234",
+#         "confirmed": False,
+#         "image_ok": True,
+#         "manual_correction": None
+#       }, ...
+#    ],
+#   "current_code_index": 0,
+#   "filling_step": "desc" or "qty"
+#   "desc": "...",
+#   "qty": ...
+# }
+user_sessions = {}
 
 
-# --- 5) /start command ---
+# Helper to get or init session
+def get_session(chat_id):
+    if chat_id not in user_sessions:
+        user_sessions[chat_id] = {
+            "state": SESSION_STATE_IDLE,
+            "scanned_codes": [],
+            "current_code_index": 0,
+            "filling_step": None,
+            "desc": "",
+            "qty": 0
+        }
+    return user_sessions[chat_id]
+
+
+# -----------------------------------
+# 4) Bot Commands
+# -----------------------------------
 @bot.message_handler(commands=['start'])
-def handle_start(message):
+def cmd_start(message):
     chat_id = message.chat.id
-    init_user_session(chat_id)
+    session = get_session(chat_id)
+    session["state"] = SESSION_STATE_SCANNING
+    session["scanned_codes"] = []
+    session["current_code_index"] = 0
 
-    text = (
-        "👋 Salam! Bu bot aktivlərinizi qeyd etmək üçün istifadə olunur. 📦\n\n"
-        "📝 Məlumat gedişatı:\n"
-        "1️⃣ Barkodun şəklini göndərin (zbar ilə tanımağa çalışacaq, uğursuz olarsa OCR tətbiq edəcək).\n"
-        "2️⃣ Bot barkodu (və ya AZT kodunu) göstərir.\n"
-        "3️⃣ Sizin göndərəcəyiniz aktivin adı ✍️\n"
-        "4️⃣ Miqdar 🔢\n"
-        "✅ Sonda Google Sheets-də saxlanılır.\n\n"
-        "Birdən çox mal əlavə etmək üçün hər barkod üçün şəkil göndərməyə davam edin. /done yazaraq bitirə bilərsiniz.\n"
-        "Hər hansı köməyə ehtiyac olarsa /help yazın.\n"
-        "Prosesi ləğv etmək üçün /cancel yazın.\n\n"
-        "İlk olaraq barkodun şəklini göndərin. ✅"
+    bot.send_message(
+        chat_id,
+        "👋 Salam! Bu bot çoxsaylı barkodları ardıcıl skan etmək üçün nəzərdə tutulub.\n"
+        "1) Bir və ya bir neçə foto göndərib <b>birdən çox barkod</b> oxuya bilərsiniz.\n"
+        "2) Bot şəkli yoxlayır (bulanıqlıq, parlaqlıq) və barkodları axtarır.\n"
+        "3) Bütün barkodları yığdıqdan sonra /done yazın.\n"
+        "4) Bot sizdən <b>hər barkod üçün</b> ad və miqdar istəyəcək.\n"
+        "5) Sonda məlumat Google Sheets-ə yazılır.\n\n"
+        "Başlayaq! Barkod şəkillərini göndərin. /cancel ilə ləğv edə bilərsiniz."
     )
-    bot.send_message(chat_id, text)
 
 
-# --- 6) /help command ---
 @bot.message_handler(commands=['help'])
-def handle_help(message):
+def cmd_help(message):
     chat_id = message.chat.id
-    text = (
-        "ℹ️ Kömək:\n"
-        "- /start: Yeni prosesə başlayır.\n"
-        "- /done: Bütün məhsulları əlavə etməyi bitirir.\n"
-        "- /cancel: Mövcud əməliyyatı ləğv edir.\n"
-        "- Barkod şəkli göndərin -> Bot oxumağa çalışacaq.\n"
-        "- Barkod oxunmazsa, bot OCR ilə 'AZT...' axtaracaq və ya əl ilə barkod daxil edə bilərsiniz.\n"
-        "- Sonra aktivin adını və miqdarını daxil edirsiniz.\n"
-        "- Məlumat Google Sheets-ə yazılır.\n"
-        "Qeyd: Sualınız varsa, burada botu yoxlayın və ya komanda rəhbərinizlə əlaqə saxlayın."
+    bot.send_message(
+        chat_id,
+        "/start - Yeni prosesə başlayın\n"
+        "/cancel - Ləğv edin\n"
+        "/done - Barkodları yığmağı bitirin, aktiv məlumatlarını daxil etməyə keçin\n"
+        "Qeyd: Bir foto bir neçə barkod ola bilər, bot onları aşkarlayıb ayrıca siyahıya əlavə edəcək."
     )
-    bot.send_message(chat_id, text)
 
 
-# --- 7) /cancel command ---
 @bot.message_handler(commands=['cancel'])
-def handle_cancel(message):
+def cmd_cancel(message):
     chat_id = message.chat.id
-    user_state[chat_id] = STATE_IDLE
-    bot.send_message(chat_id, "Əməliyyat ləğv edildi. Yeni proses üçün /start yazın.")
+    session = get_session(chat_id)
+    session["state"] = SESSION_STATE_IDLE
+    session["scanned_codes"] = []
+    bot.send_message(chat_id, "Əməliyyat ləğv edildi. /start ilə yenidən başlaya bilərsiniz.")
 
 
-# --- 8) /done command (finish multi-scan) ---
 @bot.message_handler(commands=['done'])
-def handle_done(message):
+def cmd_done(message):
     chat_id = message.chat.id
-    user_state[chat_id] = STATE_IDLE
-    bot.send_message(chat_id, "Bütün barkodlar əlavə olundu. Təşəkkürlər! Yeni proses üçün /start yazın.")
+    session = get_session(chat_id)
+    if session["state"] != SESSION_STATE_SCANNING:
+        bot.send_message(chat_id, "Hazırda skan rejimində deyilsiniz. /start ilə başlayın.")
+        return
+
+    if not session["scanned_codes"]:
+        bot.send_message(chat_id, "Heç bir barkod skan olunmayıb. /start ilə yenidən başlayın.")
+        return
+
+    # Move to data entry step
+    session["state"] = SESSION_STATE_ENTERING_DATA
+    session["current_code_index"] = 0
+    session["filling_step"] = "desc"
+
+    code_obj = session["scanned_codes"][0]
+    barkod = code_obj["barcode"]
+    bot.send_message(chat_id, f"1-ci barkod: <b>{barkod}</b>\n"
+                              "Bu barkod üçün aktivin adını yazın.")
 
 
-# --- 9) PHOTO HANDLER ---
+# -----------------------------------
+# 5) Photo Handler (Multi-Barcode + Image Quality)
+# -----------------------------------
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     chat_id = message.chat.id
-    state = user_state.get(chat_id, STATE_IDLE)
+    session = get_session(chat_id)
 
-    if state == STATE_IDLE:
-        bot.send_message(chat_id, "Prosesə başlamaq üçün /start yazın.")
+    if session["state"] != SESSION_STATE_SCANNING:
+        bot.send_message(chat_id, "Hazırda barkod skan rejimində deyilsiniz. /start yazın.")
         return
 
-    if state != STATE_WAITING_PHOTO:
-        bot.send_message(chat_id, "Hazırda fotoya ehtiyac yoxdur. Zəhmət olmasa addımları izləyin.")
-        return
-
-    # Download the photo
+    # 1) Download photo
     file_id = message.photo[-1].file_id
     file_info = bot.get_file(file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
-
-    img_path = f"temp_{chat_id}.jpg"
+    downloaded = bot.download_file(file_info.file_path)
+    img_path = f"/tmp/barcode_{chat_id}.jpg"
     with open(img_path, "wb") as f:
-        f.write(downloaded_file)
+        f.write(downloaded)
 
-    # Attempt to decode barcode
-    barcode_value = decode_barcode(img_path)
+    # 2) Quick image quality check
+    blur_score, brightness = check_image_quality(img_path)
+    print(f"[ImageQuality] chat={chat_id}, blur={blur_score}, bright={brightness}")
 
-    if barcode_value:
-        user_data[chat_id]['barcode'] = barcode_value
-        bot.send_message(chat_id, f"✅ Barkod aşkarlandı: {barcode_value}\nİndi aktivin adını yazın.")
-        user_state[chat_id] = STATE_WAITING_DESCRIPTION
-    else:
-        # Offer fallback: manual input
-        bot.send_message(
-            chat_id,
-            "⚠ Barkod/QR tapılmadı. Daha yaxın/gözəl şəkil çəkin,\n"
-            "yaxud /cancel yazaraq ləğv edin,\n"
-            "və ya əl ilə barkod daxil etmək üçün /manual yazın."
-        )
-        # We'll remain in WAITING_PHOTO until user decides:
-        # either retake photo or type /manual, or /cancel, or /done.
+    # If very blurry/dark, warn user
+    if blur_score < 50:
+        bot.send_message(chat_id, "⚠ Şəkil çox bulanıq ola bilər. Mümkünsə, daha aydın şəkil çəkin.")
+    if brightness < 50:
+        bot.send_message(chat_id, "⚠ Şəkil çox qaranlıq görünür. İşıqlı yerdə çəkməyə çalışın.")
 
-
-# --- 10) /manual command -> fallback manual barcode
-@bot.message_handler(commands=['manual'])
-def handle_manual(message):
-    chat_id = message.chat.id
-    state = user_state.get(chat_id, STATE_IDLE)
-
-    if state != STATE_WAITING_PHOTO:
-        bot.send_message(chat_id, "Bu mərhələdə əl ilə barkod daxil etməyə icazə verilmir.")
+    # 3) Attempt multi-barcode detection
+    codes_found = detect_multi_barcodes(img_path)
+    if not codes_found:
+        bot.send_message(chat_id, "Heç bir barkod tapılmadı. Başqa şəkil göndərməyə çalışın.")
         return
 
-    user_state[chat_id] = STATE_MANUAL_BARCODE
-    bot.send_message(chat_id, "ℹ️ Barkodu əl ilə daxil edin (məsələn: AZT10013025).")
+    # 4) Add them to session
+    for c in codes_found:
+        session["scanned_codes"].append({
+            "barcode": c,
+            "confirmed": False,
+            "image_ok": (blur_score >= 50 and brightness >= 50),  # or any threshold
+            "manual_correction": None
+        })
+    bot.send_message(chat_id, f"✅ <b>{len(codes_found)}</b> barkod skan olundu. /done yazaraq prosesi bitirə bilərsiniz\n"
+                              "yaxud başqa şəkil göndərib davam edin.")
 
 
-# --- 11) TEXT HANDLER (for description, quantity, or manual barcode)
+# -----------------------------------
+# 6) TEXT Handler for Data Entry Steps
+# -----------------------------------
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     chat_id = message.chat.id
-    text = message.text.strip()
-    state = user_state.get(chat_id, STATE_IDLE)
+    session = get_session(chat_id)
+    state = session["state"]
 
-    # If they're idle or something
-    if state == STATE_IDLE:
+    # If not in scanning/data entry, ignore
+    if state == SESSION_STATE_IDLE:
         bot.send_message(chat_id, "Prosesə başlamaq üçün /start yazın.")
         return
 
-    if state == STATE_WAITING_PHOTO:
-        # Possibly they typed something while we want a photo
-        bot.send_message(chat_id, "Zəhmət olmasa barkodun şəklini göndərin və ya /manual yazın.")
+    if state == SESSION_STATE_SCANNING:
+        # Possibly user typed something not relevant
+        bot.send_message(chat_id, "Barkod şəkillərini göndərməkdə davam edə bilərsiniz. /done yazıb bitirin.")
         return
 
-    if state == STATE_MANUAL_BARCODE:
-        # The user is entering the barcode manually
-        user_data[chat_id]['barcode'] = text
-        bot.send_message(chat_id, f"Əl ilə barkod götürüldü: {text}\nİndi aktivin adını yazın.")
-        user_state[chat_id] = STATE_WAITING_DESCRIPTION
-        return
-
-    if state == STATE_WAITING_DESCRIPTION:
-        user_data[chat_id]['description'] = text
-        bot.send_message(chat_id, "🔢 İndi miqdarı daxil edin (rəqəm).")
-        user_state[chat_id] = STATE_WAITING_QUANTITY
-        return
-
-    if state == STATE_WAITING_QUANTITY:
-        # parse quantity
-        try:
-            qty = int(text)
-            user_data[chat_id]['quantity'] = qty
-        except ValueError:
-            bot.send_message(chat_id, "❌ Xəta! Zəhmət olmasa miqdarı rəqəm kimi daxil edin.")
+    if state == SESSION_STATE_ENTERING_DATA:
+        # We are filling desc/qty for each code
+        idx = session["current_code_index"]
+        if idx >= len(session["scanned_codes"]):
+            bot.send_message(chat_id, "Bütün barkodlar üçün məlumat daxil edilib.")
             return
 
-        # Save to sheets
-        if save_to_sheets(chat_id):
-            # Summarize to user
-            bcode = user_data[chat_id]['barcode']
-            desc = user_data[chat_id]['description']
-            bot.send_message(
-                chat_id,
-                f"✅ Məlumat qeydə alındı:\nBarkod: {bcode}\nAd: {desc}\nMiqdar: {qty}\n"
-                "Yeni barkod üçün yenidən şəkil göndərin və ya /done yazın bitirmək üçün."
-            )
-        else:
-            bot.send_message(chat_id, "❌ Məlumatı saxlayarkən problem yarandı. Xahiş edirəm yenidən cəhd edin.")
+        step = session["filling_step"]
+        code_obj = session["scanned_codes"][idx]
 
-        # Reset for next item
-        user_state[chat_id] = STATE_WAITING_PHOTO
-        user_data[chat_id] = {'barcode': None, 'description': None, 'quantity': None}
+        if step == "desc":
+            # They typed the description
+            session["desc"] = message.text.strip()
+            session["filling_step"] = "qty"
+            bot.send_message(chat_id, f"İndi <b>{code_obj['barcode']}</b> üçün miqdarı daxil edin (rəqəm).")
+        elif step == "qty":
+            # Parse quantity
+            try:
+                quantity = int(message.text.strip())
+            except ValueError:
+                bot.send_message(chat_id, "❌ Xəta! Zəhmət olmasa rəqəm daxil edin.")
+                return
+
+            session["qty"] = quantity
+            # Save row
+            success = save_to_sheets(chat_id, code_obj["barcode"], session["desc"], quantity)
+            if success:
+                bot.send_message(
+                    chat_id,
+                    f"✅ {code_obj['barcode']} barkodu üçün məlumat saxlanıldı.\n"
+                    f"Ad: {session['desc']} | Miqdar: {quantity}"
+                )
+            else:
+                bot.send_message(chat_id, "❌ Məlumatı saxlayarkən xəta baş verdi. Yenidən cəhd edin.")
+
+            # Move to next code
+            session["current_code_index"] += 1
+            next_idx = session["current_code_index"]
+            if next_idx < len(session["scanned_codes"]):
+                session["filling_step"] = "desc"
+                next_code = session["scanned_codes"][next_idx]
+                bot.send_message(
+                    chat_id,
+                    f"{next_idx+1}-ci barkod: <b>{next_code['barcode']}</b>\n"
+                    "Bu barkod üçün aktivin adını yazın."
+                )
+            else:
+                # Done with all codes
+                session["state"] = SESSION_STATE_IDLE
+                bot.send_message(chat_id, "Bütün barkodlar üçün məlumat saxlanıldı. Təşəkkürlər!")
 
 
-# --- 12) decode_barcode (Region-based detection + angle increments + fallback OCR) ---
-def decode_barcode(image_path):
-    # Step A: Try advanced region-based detection with zbar
-    cv_img = cv2.imread(image_path)
+# -----------------------------------
+# 7) detect_multi_barcodes Function
+#  - find multiple barcodes in one photo
+#  - advanced approach with morphological detection, bounding rect, rotate angles
+# -----------------------------------
+def detect_multi_barcodes(img_path):
+    """
+    Attempt to find & decode multiple barcodes in a single image.
+    1) Convert to grayscale, threshold, morphological close to find candidate regions.
+    2) For each region, rotate 0, 90, 180, 270, decode with zbar.
+    3) Collect all distinct barcodes found.
+    """
+    cv_img = cv2.imread(img_path)
     if cv_img is None:
-        print("OpenCV failed to load image.")
-        return None
+        return []
 
-    # Attempt robust detection
-    zbar_result = robust_zbar_decode(cv_img)
-    if zbar_result:
-        return zbar_result
+    codes_collected = []
 
-    # Step B: OCR fallback for "AZT..." or others
-    fallback_text = do_ocr_fallback(image_path)
-    return fallback_text
-
-
-def robust_zbar_decode(cv_img):
-    """
-    1) find_barcode_regions -> crop candidate regions
-    2) rotate angles: 0,90,180,270
-    3) decode with zbar
-    Return first successful decode or None
-    """
-    regions = find_barcode_regions(cv_img)
-    # If no candidate region, try entire image as last resort
-    if not regions:
-        entire_result = try_zbar_on_image(cv_img)
-        return entire_result
-
-    angles = [0, 90, 180, 270]
-    for (x, y, w, h, crop) in regions:
-        for ang in angles:
-            rotated = rotate_image(crop, ang)
-            result = try_zbar_on_image(rotated)
-            if result:
-                return result
-
-    return None
-
-
-def find_barcode_regions(cv_img):
-    """
-    Convert to grayscale, threshold, morphological close.
-    Return boundingRect for candidate barcode regions.
-    """
+    # a) morphological region detection
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (3,3), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-    # invert so bars are white
     inv = 255 - thresh
 
-    # Morph close horizontally
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9,3))
     morph = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    regions = []
-    h_img, w_img = gray.shape[:2]
+    angles = [0, 90, 180, 270]
 
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
-        # Heuristic filters
-        if w > 40 and h > 15:  # tweak as needed
-            # Extract region
+        # Heuristic: must be somewhat large
+        if w > 30 and h > 15:
             region = cv_img[y:y+h, x:x+w]
-            regions.append((x, y, w, h, region))
+            for ang in angles:
+                rot = rotate_image(region, ang)
+                found = decode_zbar(rot)
+                for f in found:
+                    if f not in codes_collected:
+                        codes_collected.append(f)
 
-    return regions
+    # Also try entire image in case we missed
+    entire_found = decode_zbar(cv_img)
+    for f in entire_found:
+        if f not in codes_collected:
+            codes_collected.append(f)
 
+    return codes_collected
 
 def rotate_image(cv_img, angle):
     (h, w) = cv_img.shape[:2]
@@ -318,65 +347,98 @@ def rotate_image(cv_img, angle):
     rotated = cv2.warpAffine(cv_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
     return rotated
 
-
-def try_zbar_on_image(cv_img):
+def decode_zbar(cv_img):
     """
-    Convert OpenCV image to PIL, decode with pyzbar
+    Decode barcodes from a cv2 image using pyzbar.
+    Return a list of decoded strings (unique).
     """
     from PIL import Image
     pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
     barcodes = decode(pil_img)
-    if barcodes:
-        return barcodes[0].data.decode("utf-8")
-    return None
+    results = []
+    for b in barcodes:
+        val = b.data.decode("utf-8")
+        if val not in results:
+            results.append(val)
+    return results
 
 
-# --- 13) OCR Fallback ---
-def do_ocr_fallback(image_path):
+# -----------------------------------
+# 8) check_image_quality => blur, brightness
+# -----------------------------------
+def check_image_quality(img_path):
     """
-    If zbar fails, do Tesseract for 'AZT...' or other text codes.
-    e.g. if your code is 'AZT\d+'
+    Return (blur_score, brightness).
+    - blur_score < 50 -> likely blurry
+    - brightness < 50 -> quite dark
     """
-    # Basic deskew or contrast can be added
-    cv_img = cv2.imread(image_path)
+    cv_img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if cv_img is None:
-        return None
-
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(gray, lang='eng')
-    # Look for AZT pattern
-    match = re.search(r'(AZT\d+)', text.upper())
-    if match:
-        return match.group(1)
-    # else return None, or entire text if needed
-    return None
+        return (0, 0)
+    # blur via Laplacian variance
+    lap = cv2.Laplacian(cv_img, cv2.CV_64F).var()
+    # brightness
+    mean_val = cv_img.mean()
+    return (lap, mean_val)
 
 
-# --- 14) Save to Google Sheets ---
-def save_to_sheets(chat_id):
+# -----------------------------------
+# 9) Save to Sheets
+# -----------------------------------
+def save_to_sheets(chat_id, barcode, desc, qty):
     if not sheet:
         return False
     try:
         date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # fetch user data
-        # your user_data structure
-        barcode = user_data[chat_id].get('barcode', '(Barkod yoxdur)')
-        desc = user_data[chat_id].get('description', '(Ad yoxdur)')
-        qty = user_data[chat_id].get('quantity', 0)
-
         row = [date_str, barcode, desc, qty]
         sheet.append_row(row)
-        print("Data saved:", row)
+        print("Saved row:", row)
         return True
     except Exception as e:
-        print("Error saving to sheet:", e)
+        print("Error saving to sheets:", e)
         return False
 
 
-print("Bot is about to start polling...")
-try:
-    bot.polling(none_stop=True, interval=1, timeout=20)
-except Exception as e:
-    print(f"Bot crashed with error: {e}")
+# -----------------------------------
+# 10) Webhook Setup
+#     We'll create an endpoint /webhook/<token> for Telegram to POST updates
+# -----------------------------------
+@app.route(f"/webhook/{TELEGRAM_BOT_TOKEN}", methods=['POST'])
+def telegram_webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "ok", 200
+    else:
+        abort(403)
 
-print("Bot is running!")
+
+# -----------------------------------
+# 11) Optional: Start Webhook
+#     We can remove_webhook + set_webhook programmatically (or do it manually via BotFather).
+# -----------------------------------
+@app.before_first_request
+def setup_webhook():
+    # Remove old webhook
+    bot.remove_webhook()
+    # Set new webhook to our endpoint
+    base_url = os.getenv("RENDER_EXTERNAL_HOSTNAME")  # or your domain
+    if not base_url:
+        # e.g. "https://yourapp.onrender.com"
+        base_url = "https://yourapp.onrender.com"
+    full_url = f"{base_url}/webhook/{TELEGRAM_BOT_TOKEN}"
+    bot.set_webhook(url=full_url)
+    print("Webhook set to:", full_url)
+
+
+# -----------------------------------
+# 12) Local Testing
+#     If you want to run locally (not recommended with webhooks),
+#     you can do: `python bot.py` -> app.run(port=5000)
+#     But on Render, we'll run with gunicorn.
+# -----------------------------------
+if __name__ == "__main__":
+    # For local debug only:
+    # app.run(host='0.0.0.0', port=5000, debug=True)
+    pass

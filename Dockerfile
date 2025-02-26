@@ -1,10 +1,14 @@
+# Dockerfile
+
 FROM python:3.11-slim
 
-# Install system dependencies needed by:
-#  - pyzbar (zbar)
-#  - Tesseract OCR
-#  - OpenCV (libGL, etc.)
+# 1) Install system dependencies for:
+#   - pyzbar (zbar)
+#   - tesseract OCR
+#   - OpenCV (libGL, etc.)
+#   - For building some Python packages (e.g., pip's needs)
 RUN apt-get update && apt-get install -y \
+    build-essential \
     libzbar0 \
     tesseract-ocr \
     libgl1 \
@@ -17,8 +21,14 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# 2) Copy code
 COPY . /app
 
+# 3) Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["python", "bot.py"]
+# 4) Expose port 5000 for the webhook
+EXPOSE 5000
+
+# 5) Start your Flask server via gunicorn
+CMD ["gunicorn", "bot:app", "--bind", "0.0.0.0:5000", "--workers=1"]
