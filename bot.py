@@ -17,21 +17,21 @@ from thefuzz import process
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 ########################################
-# ENV
+# Ətraf Mühit Dəyişənləri
 ########################################
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON")
-ASSET_TAB_NAME = "Asset Data"
+ASSET_TAB_NAME = "Asset Data"  # Aktiv adları olan sheet
 
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN not set")
+    raise ValueError("TELEGRAM_BOT_TOKEN tapılmadı!")
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
 ########################################
-# GSheets
+# Google Sheets Konfiqurasiyası
 ########################################
 creds_dict = json.loads(SERVICE_ACCOUNT_JSON)
 scope = [
@@ -42,26 +42,26 @@ credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope
 gc = gspread.authorize(credentials)
 
 main_sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
-print("Connected to main sheet:", main_sheet.title)
+print("Google Sheets bağlantısı uğurlu:", main_sheet.title)
 
-# Load asset data
 try:
     asset_worksheet = gc.open_by_key(SPREADSHEET_ID).worksheet(ASSET_TAB_NAME)
     asset_data = asset_worksheet.col_values(1)
     if asset_data and asset_data[0].lower().startswith("asset"):
         asset_data.pop(0)
 except Exception as e:
-    print("Error loading asset data:", e)
+    print("Aktiv adları yüklənərkən xəta:", e)
     asset_data = []
 
-print(f"Loaded {len(asset_data)} asset names from '{ASSET_TAB_NAME}' tab.")
+print(f"'{ASSET_TAB_NAME}' səhifəsindən {len(asset_data)} ad yükləndi.")
 
 ########################################
-# SESSION
+# Sessiya Məlumatları
 ########################################
-user_data = {}  # chat_id -> {}
-user_state = {} # chat_id -> str state
+user_data = {}  # chat_id -> {...}
+user_state = {} # chat_id -> state (str)
 
+# Mümkün states
 STATE_IDLE = "idle"
 STATE_WAIT_LOCATION = "wait_location"
 STATE_WAIT_INVENTORY_CHOICE = "wait_inventory_choice"
@@ -76,118 +76,113 @@ def init_session(chat_id):
     user_data[chat_id] = {
         "location": "",
         "inventory_code": "",
-        "location_timestamp": datetime.now() - timedelta(days=1),
-        "mode": "single",
-        "barcodes": [],
-        "index": 0,
-        "asset_name": "",
-        "qty": 0,
-        "pending_barcode": None, # for final confirm
+        "mode": "single",   # tək və ya multi
+        "barcodes": [],     # tapılan barkodlar
+        "index": 0,         # çox barkodda hansındayıq
+        "asset_name": "",   # fuzzy seçilmiş ad
+        "qty": 0,           # miqdar
+        "pending_barcode": None,
         "pending_asset": None,
         "pending_qty": None
     }
     user_state[chat_id] = STATE_IDLE
 
-def need_location(chat_id):
-    now = datetime.now()
-    last = user_data[chat_id]["location_timestamp"]
-    if (now - last)>timedelta(minutes=30):
-        if now.date()!=last.date():
-            return True
-        return True
-    return False
-
 ########################################
-# WEBHOOK
+# Webhook Qurulması
 ########################################
 def setup_webhook():
     bot.remove_webhook()
     domain = os.getenv("RENDER_EXTERNAL_HOSTNAME") or "https://yourapp.onrender.com"
     wh_url = f"{domain}/webhook/{TELEGRAM_BOT_TOKEN}"
     bot.set_webhook(url=wh_url)
-    print("Webhook set to:", wh_url)
+    print("Webhook quruldu:", wh_url)
 
 ########################################
-# /start & /finish
+# /start, /finish və /cancel Komandaları
 ########################################
 @bot.message_handler(commands=['start'])
-def cmd_start(msg):
-    chat_id = msg.chat.id
+def cmd_start(message):
+    chat_id = message.chat.id
     init_session(chat_id)
-    # Show a short guide with emojis, plus an "Enter Location" button
+
     guide_text = (
-        "👋 Salam, xoş gəldiniz!\n"
-        "🔹 1) 'Enter Location' düyməsinə basın və yerləşdiyiniz yeri daxil edin.\n"
-        "🔹 2) İnventar kodu (olsa) daxil edin və ya 'No inventory code' seçin.\n"
-        "🔹 3) Tək barkod skan ya çox barkod skan rejimini seçin.\n"
-        "🔹 4) Barkodun şəklini göndərin, bot onu tanıyacaq.\n"
-        "🔹 5) Məhsulun adını fuzzy search ilə seçin və say daxil edin.\n"
-        "🔹 6) Təsdiqlədikdən sonra Google Sheets-ə yazılacaq.\n"
-        "💡 Sonda /finish yaza bilərsiniz günü bitirmək üçün.\n"
+        "👋 Salam! Bu botla günə başlayırsınız.\n"
+        "🔹 Adımlar:\n"
+        "1) 'Yer Daxil Et' düyməsinə klikləyib olduğunuz məkanı qeyd edin.\n"
+        "2) İstəsəniz inventar kodunu daxil edin, ya da 'Heç inventar kodu yoxdur' deyin.\n"
+        "3) Tək veya çox barkod rejimini seçin.\n"
+        "4) Barkodlu şəkilləri göndərin, bot skan edəcək.\n"
+        "5) Məhsul adını (fuzzy search), sayını daxil edin.\n"
+        "6) Sonda Edit/Delete/Confirm ilə təsdiqləyin.\n"
+        "✅ Günü bitirmək üçün /finish yazın.\n"
     )
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Enter Location", callback_data="ENTER_LOCATION"))
+    kb.add(InlineKeyboardButton("Yer Daxil Et", callback_data="ENTER_LOCATION"))
     bot.send_message(chat_id, guide_text, reply_markup=kb)
 
 @bot.message_handler(commands=['finish'])
-def cmd_finish(msg):
-    chat_id = msg.chat.id
+def cmd_finish(message):
+    chat_id = message.chat.id
     init_session(chat_id)
-    bot.send_message(chat_id,
-        "Günü bitirdiniz. Bütün məlumat tamamlandı. Sabah yenidən /start yaza bilərsiniz.")
+    bot.send_message(chat_id, "Günü bitirdiniz. Növbəti gün /start yaza bilərsiniz.")
 
 @bot.message_handler(commands=['cancel'])
-def cmd_cancel(msg):
-    chat_id = msg.chat.id
+def cmd_cancel(message):
+    chat_id = message.chat.id
     init_session(chat_id)
-    bot.send_message(chat_id, "Cari proses ləğv edildi. /start yaza bilərsiniz yenidən.")
+    bot.send_message(chat_id, "Cari əməliyyat ləğv edildi. Yeni gün üçün /start yazın.")
 
 ########################################
-# Callback: Enter Location
+# Lokasiyanı Daxil Et
 ########################################
-@bot.callback_query_handler(func=lambda c: c.data=="ENTER_LOCATION")
+@bot.callback_query_handler(func=lambda c: c.data == "ENTER_LOCATION")
 def cb_enter_location(call):
     chat_id = call.message.chat.id
     user_state[chat_id] = STATE_WAIT_LOCATION
-    bot.send_message(chat_id,
-        "Zəhmət olmasa mövcud lokasiyanızı daxil edin (örn: 'Anbar 2').")
+    bot.send_message(chat_id, "Olduğunuz məkanı daxil edin (məs: 'Anbar A').")
 
-@bot.message_handler(func=lambda m: user_state.get(m.chat.id)==STATE_WAIT_LOCATION, content_types=['text'])
-def handle_location(m):
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id) == STATE_WAIT_LOCATION, content_types=['text'])
+def handle_location_input(m):
     chat_id = m.chat.id
     loc = m.text.strip()
     user_data[chat_id]["location"] = loc
-    user_data[chat_id]["location_timestamp"] = datetime.now()
-    # Next: inventory code
+
+    # Sonra inventar kodu
     kb = InlineKeyboardMarkup()
     kb.add(
-        InlineKeyboardButton("Enter Inventory Code", callback_data="INVENTORY_ENTER"),
-        InlineKeyboardButton("No inventory code", callback_data="INVENTORY_NONE")
+        InlineKeyboardButton("İnventar Kodunu Daxil Et", callback_data="INVENTORY_ENTER"),
+        InlineKeyboardButton("Heç inventar kodu yoxdur", callback_data="INVENTORY_NONE")
     )
     bot.send_message(chat_id,
-        f"Lokasiya: <b>{loc}</b>\nİnventar kodu əlavə etmək istəyirsiniz?",
+        f"Lokasiya '{loc}' olaraq qəbul edildi.\nİnventar kodu daxil etmək istəyirsiniz?",
         reply_markup=kb
     )
 
+########################################
+# İnventar Kodu
+########################################
 @bot.callback_query_handler(func=lambda c: c.data in ["INVENTORY_ENTER", "INVENTORY_NONE"])
 def cb_inventory_choice(call):
     chat_id = call.message.chat.id
-    if call.data=="INVENTORY_ENTER":
+    if call.data == "INVENTORY_ENTER":
         user_state[chat_id] = STATE_WAIT_INVENTORY_INPUT
-        bot.send_message(chat_id, "Zəhmət olmasa inventar kodunu əl ilə daxil edin.")
+        bot.send_message(chat_id, "İnventar kodunu əl ilə yazın.")
     else:
-        # no inventory code
         user_data[chat_id]["inventory_code"] = ""
         show_mode_keyboard(chat_id)
 
-@bot.message_handler(func=lambda m: user_state.get(m.chat.id)==STATE_WAIT_INVENTORY_INPUT, content_types=['text'])
+@bot.message_handler(func=lambda m: user_state.get(m.chat.id) == STATE_WAIT_INVENTORY_INPUT, content_types=['text'])
 def handle_inventory_input(m):
     chat_id = m.chat.id
-    inv_code = m.text.strip()
-    user_data[chat_id]["inventory_code"] = inv_code
-    bot.send_message(chat_id, f"İnventar kodu qəbul edildi: <b>{inv_code}</b>")
+    inv = m.text.strip()
+    user_data[chat_id]["inventory_code"] = inv
+    bot.send_message(chat_id,
+        f"İnventar kodu qəbul edildi: <b>{inv}</b>\nRejim seçməyə keçək.")
     show_mode_keyboard(chat_id)
 
+########################################
+# Barkod Rejimi Seç
+########################################
 def show_mode_keyboard(chat_id):
     kb = InlineKeyboardMarkup()
     kb.row(
@@ -200,78 +195,139 @@ def show_mode_keyboard(chat_id):
     )
     user_state[chat_id] = STATE_WAIT_PHOTO
 
-@bot.callback_query_handler(func=lambda c: c.data in ["MODE_SINGLE", "MODE_MULTI"])
-def pick_mode(call):
+@bot.callback_query_handler(func=lambda c: c.data in ["MODE_SINGLE","MODE_MULTI"])
+def pick_mode_cb(call):
     chat_id = call.message.chat.id
-    mode = call.data
-    user_data[chat_id]["mode"] = "single" if mode=="MODE_SINGLE" else "multi"
-    user_data[chat_id]["barcodes"].clear()
-    user_data[chat_id]["index"] = 0
-
-    if mode=="MODE_SINGLE":
-        bot.send_message(chat_id,
-            "Tək barkod rejimi seçildi.\nZəhmət olmasa barkodun şəklini göndərin.")
+    if call.data=="MODE_SINGLE":
+        user_data[chat_id]["mode"] = "single"
+        bot.send_message(chat_id, "Tək barkod rejimi seçildi. Zəhmət olmasa barkod şəkli göndərin.")
     else:
-        # multi => add finish & stop/restart
+        user_data[chat_id]["mode"] = "multi"
         kb = InlineKeyboardMarkup()
         kb.row(
             InlineKeyboardButton("Bitir", callback_data="FINISH_MULTI"),
             InlineKeyboardButton("Stop/Restart", callback_data="STOP_RESTART")
         )
         bot.send_message(chat_id,
-            "Çox barkod rejimi. Bir neçə barkod şəkil göndərin.\n"
-            "Bitirəndə 'Bitir', imtina üçün 'Stop/Restart'.",
+            "Çox barkod rejimi. Bir neçə barkodlu şəkil göndərə bilərsiniz.\n"
+            "Bitirəndə 'Bitir', ləğv üçün 'Stop/Restart' düyməsinə basın.",
             reply_markup=kb
         )
+
+    user_data[chat_id]["barcodes"].clear()
+    user_data[chat_id]["index"] = 0
+    user_state[chat_id] = STATE_WAIT_PHOTO
 
 @bot.callback_query_handler(func=lambda c: c.data=="STOP_RESTART")
 def cb_stop_restart(call):
     chat_id = call.message.chat.id
     init_session(chat_id)
     bot.send_message(chat_id,
-        "Əvvəlki proses ləğv edildi.\nYeni gün üçün /start yaza bilərsiniz.")
+        "Mövcud proses ləğv edildi. Yeni gün üçün /start yazın.")
 
 @bot.callback_query_handler(func=lambda c: c.data=="FINISH_MULTI")
 def cb_finish_multi(call):
     chat_id = call.message.chat.id
     bcs = user_data[chat_id]["barcodes"]
     if not bcs:
-        bot.send_message(chat_id, "Heç barkod yoxdur. Yenidən şəkil göndərin.")
+        bot.send_message(chat_id,"Heç barkod yoxdur. Yenidən şəkil göndərin.")
         return
     user_data[chat_id]["index"] = 0
     first_bc = bcs[0]
     bot.send_message(chat_id,
-        f"{len(bcs)} barkod aşkar olundu.\n"
+        f"{len(bcs)} barkod aşkarlandı.\n"
         f"1-ci barkod: <b>{first_bc}</b>\n"
         "Məhsul adını (tam və ya qismən) daxil edin."
     )
     user_state[chat_id] = STATE_WAIT_ASSET
 
-@bot.message_handler(commands=['finish'])
-def cmd_finish(m):
-    chat_id = m.chat.id
-    init_session(chat_id)
-    bot.send_message(chat_id,
-        "Günü bitirdiniz. Bütün proseslər tamamlandı. /start yaza bilərsiniz "
-        "növbəti iş üçün.")
-
 ########################################
-# MULTI BARCODE DETECTION
+# Barkodları Tanıma (Çoxsaylı)
 ########################################
 def detect_multi_barcodes(np_img):
-    # Your morphological passes, angle increments, multi decode, pattern check...
-    # omitted for brevity, but same as the final advanced approach
-    # Return a list of codes
-    return ["FAKE123"]  # placeholder, copy from previous code
+    # 1) Parlaqlıq artırmaq (əgər çox qaranlıqdırsa)
+    mean_val = np_img.mean()
+    if mean_val < 60:
+        np_img = cv2.convertScaleAbs(np_img, alpha=1.5, beta=30)
+
+    # 2) Morphological pass
+    gray = cv2.cvtColor(np_img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3,3), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    inv = 255 - thresh
+
+    # Birinci pass: böyük kernel
+    kernel_big = cv2.getStructuringElement(cv2.MORPH_RECT, (11,4))
+    morph1 = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel_big)
+
+    # İkinci pass: kiçik kernel
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+    morph2 = cv2.morphologyEx(morph1, cv2.MORPH_OPEN, kernel_small)
+
+    contours, _ = cv2.findContours(morph2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    found_codes = set()
+    angles = range(0, 360, 10)  # 10 dərəcədənsə 360
+
+    for c in contours:
+        x,y,w,h = cv2.boundingRect(c)
+        if w>20 and h>20:
+            region = np_img[y:y+h, x:x+w]
+            region_codes = try_decode_region(region, angles)
+            for cd in region_codes:
+                if is_our_barcode(cd):
+                    found_codes.add(cd)
+
+    # Bütün şəkil üçün də cəhd edirik
+    whole_codes = try_decode_region(np_img, angles)
+    for ccc in whole_codes:
+        if is_our_barcode(ccc):
+            found_codes.add(ccc)
+
+    return list(found_codes)
+
+def try_decode_region(np_img, angles):
+    results = set()
+    for ang in angles:
+        rot = rotate_image(np_img, ang)
+        multi = decode_zbar_multi(rot)
+        for code_ in multi:
+            results.add(code_)
+    return list(results)
+
+def rotate_image(cv_img, angle):
+    (h, w) = cv_img.shape[:2]
+    center = (w//2,h//2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(cv_img, M, (w,h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    return rotated
+
+def decode_zbar_multi(cv_img):
+    from PIL import Image
+    pil_img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+    barcodes = decode(pil_img, symbols=[
+        ZBarSymbol.CODE128, ZBarSymbol.CODE39, ZBarSymbol.EAN13,
+        ZBarSymbol.EAN8, ZBarSymbol.QRCODE
+    ])
+    out = []
+    for b in barcodes:
+        out.append(b.data.decode("utf-8"))
+    return out
+
+def is_our_barcode(code):
+    # Məsələn, '^AZT\\d+'
+    pattern = r'^AZT\d+'
+    return bool(re.match(pattern, code))
 
 ########################################
-# Photo Handler
+# Foto Göndərilən Zaman
 ########################################
 @bot.message_handler(content_types=['photo'])
 def handle_photo(m):
     chat_id = m.chat.id
-    if user_state.get(chat_id, STATE_IDLE)!=STATE_WAIT_PHOTO:
-        bot.send_message(chat_id, "Foto qəbul edilmir. /start edin.")
+    st = user_state.get(chat_id, STATE_IDLE)
+    if st!=STATE_WAIT_PHOTO:
+        bot.send_message(chat_id,"Hazırda şəkil qəbul olunmur. /start ilə başlayın.")
         return
 
     file_id = m.photo[-1].file_id
@@ -280,63 +336,58 @@ def handle_photo(m):
     np_img = np.frombuffer(downloaded, np.uint8)
     cv_img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
 
-    found_codes = detect_multi_barcodes(cv_img)  # advanced scanning
-    if not found_codes:
-        bot.send_message(chat_id, "Heç bir barkod tapılmadı. Daha aydın/diqqətli foto.")
+    found = detect_multi_barcodes(cv_img)
+    if not found:
+        bot.send_message(chat_id,"Heç barkod aşkar edilmədi. Daha aydın şəkil çəkin.")
         return
 
     if user_data[chat_id]["mode"]=="single":
-        bc = found_codes[0]
+        bc = found[0]
         user_data[chat_id]["barcodes"] = [bc]
-        if len(found_codes)>1:
+        if len(found)>1:
             bot.send_message(chat_id,
-                f"{len(found_codes)} barkod aşkar, birincisi seçildi: <b>{bc}</b>")
+                f"{len(found)} barkod tapıldı, birincisi götürülür: <b>{bc}</b>")
         else:
             bot.send_message(chat_id, f"Barkod: <b>{bc}</b>")
-        bot.send_message(chat_id,
-            "Məhsul adını (tam və ya qismən) daxil edin.")
+        bot.send_message(chat_id, "Məhsul adını (tam və ya qismən) daxil edin.")
         user_state[chat_id] = STATE_WAIT_ASSET
     else:
         # multi
         existing = set(user_data[chat_id]["barcodes"])
-        for c in found_codes:
+        for c in found:
             existing.add(c)
         user_data[chat_id]["barcodes"] = list(existing)
         bot.send_message(chat_id,
-            f"Barkod(lar): {', '.join(found_codes)}\n"
-            "Daha şəkil göndərin və ya 'Bitir' / 'Stop/Restart'."
+            f"Barkod(lar): {', '.join(found)}\n"
+            "Daha şəkil göndərməyə davam edin və ya 'Bitir' / 'Stop/Restart'."
         )
 
 ########################################
-# Fuzzy Name
+# Fuzzy axtarış
 ########################################
 def fuzzy_suggest(query, data, limit=3):
-    # existing function or advanced from before
-    return []
+    if not data:
+        return []
+    return process.extract(query, data, limit=limit)
 
 @bot.message_handler(func=lambda x: user_state.get(x.chat.id)==STATE_WAIT_ASSET, content_types=['text'])
 def handle_asset_name(x):
     chat_id = x.chat.id
-    query = x.text.strip()
-    # do fuzzy
-    suggestions = fuzzy_suggest(query, asset_data, limit=3)
+    q = x.text.strip()
+    suggestions = fuzzy_suggest(q, asset_data, limit=3)
     if not suggestions:
-        # no suggestions => accept as custom
-        finalize_asset_info(chat_id, query)
+        finalize_asset_info(chat_id, q)
         return
+
     kb = InlineKeyboardMarkup()
-    for (name,score) in suggestions:
+    for (name_,score_) in suggestions:
         kb.add(InlineKeyboardButton(
-            text=f"{name} ({score}%)",
-            callback_data=f"ASSET_PICK|{name}"
+            text=f"{name_} ({score_}%)", callback_data=f"ASSET_PICK|{name_}"
         ))
     kb.add(InlineKeyboardButton(
-        text="Custom Name", callback_data=f"ASSET_CUSTOM|{query}"
+        text="Custom Name", callback_data=f"ASSET_CUSTOM|{q}"
     ))
-    bot.send_message(chat_id,
-        "Uyğun adlar, ya 'Custom Name':",
-        reply_markup=kb
-    )
+    bot.send_message(chat_id,"Aşağıdakı adlardan birini seçin və ya 'Custom Name':", reply_markup=kb)
     user_state[chat_id] = STATE_WAIT_ASSET_PICK
 
 @bot.message_handler(func=lambda x: user_state.get(x.chat.id)==STATE_WAIT_ASSET_PICK, content_types=['text'])
@@ -349,37 +400,33 @@ def handle_asset_retry(x):
         return
 
     kb = InlineKeyboardMarkup()
-    for (name,score) in suggestions:
+    for (name_,score_) in suggestions:
         kb.add(InlineKeyboardButton(
-            text=f"{name} ({score}%)",
-            callback_data=f"ASSET_PICK|{name}"
+            text=f"{name_} ({score_}%)", callback_data=f"ASSET_PICK|{name_}"
         ))
     kb.add(InlineKeyboardButton(
         text="Custom Name", callback_data=f"ASSET_CUSTOM|{q}"
     ))
-    bot.send_message(chat_id,
-        "Uyğun adlar, ya 'Custom Name':",
-        reply_markup=kb
-    )
+    bot.send_message(chat_id,"Aşağıdakı adlardan birini seçin və ya 'Custom Name':", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ASSET_PICK|"))
 def cb_asset_pick(call):
     chat_id = call.message.chat.id
-    name_ = call.data.split("|")[1]
-    finalize_asset_info(chat_id, name_)
+    picked = call.data.split("|")[1]
+    finalize_asset_info(chat_id, picked)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("ASSET_CUSTOM|"))
 def cb_asset_custom(call):
     chat_id = call.message.chat.id
-    custom = call.data.split("|")[1]
-    finalize_asset_info(chat_id, custom)
+    custom_ = call.data.split("|")[1]
+    finalize_asset_info(chat_id, custom_)
 
 def finalize_asset_info(chat_id, name_):
     user_data[chat_id]["asset_name"] = name_
     ask_quantity(chat_id)
 
 ########################################
-# QUANTITY
+# Miqdar girişi
 ########################################
 def ask_quantity(chat_id):
     kb = InlineKeyboardMarkup()
@@ -389,15 +436,15 @@ def ask_quantity(chat_id):
         InlineKeyboardButton("3", callback_data="QTY|3"),
         InlineKeyboardButton("Other", callback_data="QTY|OTHER")
     )
-    nm = user_data[chat_id]["asset_name"]
+    n = user_data[chat_id]["asset_name"]
     bot.send_message(chat_id,
-        f"Ad: <b>{nm}</b>\nMiqdarı seçin:",
+        f"Məhsul adı: <b>{n}</b>\nMiqdarı seçin:",
         reply_markup=kb
     )
     user_state[chat_id] = STATE_WAIT_QUANTITY
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("QTY|"))
-def cb_qty_pick(call):
+def cb_qty(call):
     chat_id = call.message.chat.id
     pick = call.data.split("|")[1]
     if pick=="OTHER":
@@ -410,14 +457,14 @@ def cb_qty_pick(call):
 def handle_qty_text(m):
     chat_id = m.chat.id
     try:
-        q = int(m.text.strip())
-        user_data[chat_id]["qty"] = q
+        val = int(m.text.strip())
+        user_data[chat_id]["qty"] = val
         show_entry_summary(chat_id)
     except:
-        bot.send_message(chat_id,"Zəhmət olmasa düzgün rəqəm.")
+        bot.send_message(chat_id, "Zəhmət olmasa düzgün rəqəm.")
 
 ########################################
-# SHOW SUMMARY WITH EDIT/DELETE/CONFIRM
+# Edit / Delete / Confirm Step
 ########################################
 def show_entry_summary(chat_id):
     data = user_data[chat_id]
@@ -428,13 +475,13 @@ def show_entry_summary(chat_id):
     qty = data["qty"]
     loc = data["location"]
     inv = data["inventory_code"]
-    # store pending so we can do confirm later
+
     data["pending_barcode"] = bc
     data["pending_asset"] = desc
     data["pending_qty"] = qty
 
     text = (
-        f"📋 Baxış:\n"
+        "📋 Girişə Baxış:\n"
         f"Lokasiya: {loc}\n"
         f"İnventar kodu: {inv}\n"
         f"Barkod: {bc}\n"
@@ -455,62 +502,63 @@ def show_entry_summary(chat_id):
 def cb_entry_decision(call):
     chat_id = call.message.chat.id
     choice = call.data
-    data = user_data[chat_id]
+    d = user_data[chat_id]
+
     if choice=="ENTRY_EDIT":
-        # re-run the product name/qty
-        # user wants to fix the asset name or quantity
-        # let's go back to handle_asset step
+        # yenidən məhsul adı + miqdar
         bot.send_message(chat_id,
             "Məhsul adını yenidən daxil edin (tam və ya qismən).")
         user_state[chat_id] = STATE_WAIT_ASSET
+
     elif choice=="ENTRY_DELETE":
-        # user doesn't want to store this item at all
-        bot.send_message(chat_id, "Bu barkod məlumatı silindi.")
-        # proceed if multi
-        if data["mode"]=="multi":
-            data["index"]+=1
-            if data["index"]<len(data["barcodes"]):
-                next_bc = data["barcodes"][data["index"]]
+        bot.send_message(chat_id,
+            "Bu barkod silindi. Başqa barkod varsa foto göndərin ya da 'Bitir' düyməsi.")
+        if d["mode"]=="multi":
+            d["index"]+=1
+            if d["index"]<len(d["barcodes"]):
+                next_bc = d["barcodes"][d["index"]]
                 bot.send_message(chat_id,
-                    f"{data['index']+1}-ci barkod: <b>{next_bc}</b>\n"
+                    f"{d['index']+1}-ci barkod: <b>{next_bc}</b>\n"
                     "Məhsul adını (tam/qismən) daxil edin.")
                 user_state[chat_id] = STATE_WAIT_ASSET
             else:
-                bot.send_message(chat_id, "Bütün barkodlar tamamlandı!")
+                bot.send_message(chat_id,
+                    "Bütün barkodlar üçün məlumat tamamlandı! /finish yaza bilərsiniz.")
                 user_state[chat_id] = STATE_IDLE
         else:
-            # single mode done
-            bot.send_message(chat_id, "Tək barkod prosesi bitdi. /start yazın yeni gün üçün.")
+            bot.send_message(chat_id,
+                "Tək barkod prosesi bitdi! /finish ilə günü bitirə bilərsiniz.")
             user_state[chat_id] = STATE_IDLE
+
     else:
-        # ENTRY_CONFIRM => append row
-        bc = data["pending_barcode"]
-        desc = data["pending_asset"]
-        qty = data["pending_qty"]
-        loc = data["location"]
-        inv = data["inventory_code"]
+        # ENTRY_CONFIRM
+        bc = d["pending_barcode"]
+        desc = d["pending_asset"]
+        qty = d["pending_qty"]
+        loc = d["location"]
+        inv = d["inventory_code"]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # store row => [time, location, inv, bc, desc, qty]
         try:
             main_sheet.append_row([now, loc, inv, bc, desc, qty])
-            bot.send_message(chat_id, "✅ Məlumat cədvələ əlavə olundu.")
+            bot.send_message(chat_id, "✅ Məlumat Cədvələ Əlavə Olundu.")
         except Exception as e:
             bot.send_message(chat_id, f"❌ Xəta: {e}")
 
-        # proceed if multi
-        if data["mode"]=="multi":
-            data["index"]+=1
-            if data["index"]<len(data["barcodes"]):
-                nb = data["barcodes"][data["index"]]
+        if d["mode"]=="multi":
+            d["index"]+=1
+            if d["index"]<len(d["barcodes"]):
+                nb = d["barcodes"][d["index"]]
                 bot.send_message(chat_id,
-                    f"{data['index']+1}-ci barkod: <b>{nb}</b>\n"
-                    "Məhsul adını daxil edin.")
+                    f"{d['index']+1}-ci barkod: <b>{nb}</b>\n"
+                    "Məhsul adını daxil edin (tam/qismən).")
                 user_state[chat_id] = STATE_WAIT_ASSET
             else:
-                bot.send_message(chat_id, "Bütün barkodların məlumatı tamamlandı! /finish yaza bilərsiniz.")
+                bot.send_message(chat_id,
+                    "Bütün barkodlar bitdi! /finish yaza bilərsiniz.")
                 user_state[chat_id] = STATE_IDLE
         else:
-            bot.send_message(chat_id, "Tək barkod prosesi bitdi! /finish yaza bilərsiniz.")
+            bot.send_message(chat_id,
+                "Tək barkod prosesi bitdi. /finish yaza bilərsiniz.")
             user_state[chat_id] = STATE_IDLE
 
 ########################################
